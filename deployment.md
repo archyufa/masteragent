@@ -100,8 +100,30 @@ adk deploy cloud_run \
 
 For highly secure environments requiring **no public IP**, you must use **Private Service Connect (PSC)**. This allows Gemini Enterprise to talk to your agent over Google's private network.
 
-### 1. Deploy Internal-Only Service
-Use `gcloud` directly to enforce internal ingress:
+![Architecture Flow](architecture_private_cloud_run.png)
+
+### 1. Network Prerequisites
+You need specific subnets for the Internal Load Balancer (Envoy-based) and for PSC Source NAT.
+
+```bash
+# 1. Create Proxy-only subnet (Required for Envoy-based ILB)
+gcloud compute networks subnets create proxy-only-subnet \
+  --purpose=REGIONAL_MANAGED_PROXY \
+  --role=ACTIVE \
+  --region=us-central1 \
+  --network=YOUR_VPC_NETWORK \
+  --range=10.129.0.0/23
+
+# 2. Create PSC NAT subnet (Required for Service Attachment)
+gcloud compute networks subnets create psc-nat-subnet \
+  --purpose=PRIVATE_SERVICE_CONNECT \
+  --region=us-central1 \
+  --network=YOUR_VPC_NETWORK \
+  --range=10.130.0.0/24
+```
+
+### 2. Deploy Internal-Only Service
+Use `gcloud` to deploy your agent, enforcing internal ingress only.
 
 ```bash
 gcloud run deploy my-secure-agent \
@@ -111,13 +133,66 @@ gcloud run deploy my-secure-agent \
   --no-allow-unauthenticated
 ```
 
-### 2. Configure Connectivity (Advanced)
-Since the service has no public IP, Gemini Enterprise cannot reach it directly over the internet. You must:
-1.  **Create an Internal Application Load Balancer (ALB)** in your VPC fronting the Cloud Run service.
-2.  **Create a Service Attachment** for that ALB.
-3.  **Register with Gemini**: In the Gemini Enterprise console, when adding the agent (via Agent2Agent), use the **Service Attachment URI** instead of a public URL.
+### 3. Configure Internal Load Balancer (ALB)
+Since the Cloud Run service is internal, we must put an Internal Application Load Balancer in front of it.
 
-*Note: This architecture requires a VPC and specific subnet configuration.*
+```bash
+# 1. Create Serverless Network Endpoint Group (NEG)
+gcloud compute network-endpoint-groups create my-agent-neg \
+  --region=us-central1 \
+  --network-endpoint-type=serverless \
+  --cloud-run-service=my-secure-agent
+
+# 2. Create Backend Service & Add NEG
+gcloud compute backend-services create my-agent-backend \
+  --load-balancing-scheme=INTERNAL_MANAGED \
+  --region=us-central1 \
+  --protocol=HTTP
+
+gcloud compute backend-services add-backend my-agent-backend \
+  --network-endpoint-group=my-agent-neg \
+  --network-endpoint-group-region=us-central1 \
+  --region=us-central1
+
+# 3. Create Routing Rules (URL Map & Proxy)
+gcloud compute url-maps create my-agent-map \
+  --default-service=my-agent-backend \
+  --region=us-central1
+
+gcloud compute target-http-proxies create my-agent-proxy \
+  --url-map=my-agent-map \
+  --region=us-central1
+
+# 4. Create Forwarding Rule (The Internal VIP)
+# NOTE: --subnet must be your MAIN subnet (where workloads run), NOT the proxy/psc subnet
+gcloud compute forwarding-rules create my-agent-forwarding-rule \
+  --load-balancing-scheme=INTERNAL_MANAGED \
+  --network=YOUR_VPC_NETWORK \
+  --subnet=YOUR_MAIN_SUBNET \
+  --target-http-proxy=my-agent-proxy \
+  --ports=80 \
+  --region=us-central1
+```
+
+### 4. Create Service Attachment (PSC)
+Now we expose that Internal Load Balancer via Private Service Connect so Gemini can reach it.
+
+```bash
+gcloud compute service-attachments create my-agent-psa \
+  --region=us-central1 \
+  --producer-forwarding-rule=my-agent-forwarding-rule \
+  --connection-preference=ACCEPT_AUTOMATIC \
+  --nat-subnets=psc-nat-subnet
+```
+
+### 5. Register with Gemini
+1.  **Get the Service Attachment URI**:
+    It will look like: `projects/YOUR_PROJECT/regions/us-central1/serviceAttachments/my-agent-psa`
+2.  **Add to Gemini Enterprise**:
+    *   When adding the agent, select **Custom agent via A2A**.
+    *   For **Endpoint URL**, select **Private Service Connect**.
+    *   Paste your **Service Attachment URI**.
+
 
 ---
 
